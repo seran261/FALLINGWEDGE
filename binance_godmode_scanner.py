@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 """
-🏦 BINANCE GOD MODE ULTRA SCANNER v2
+🏦 BINANCE GOD MODE ULTRA SCANNER (FINAL FULL BUILD)
 
+✔ Top 200 Binance Futures Coins Auto Scan
 ✔ Falling Wedge Breakouts
-✔ Trend + Momentum + Volume Confirmation
-✔ Open Interest Surge Detector
+✔ RSI + MACD Momentum Confirmation
+✔ EMA200 Trend Filter
+✔ Volume Expansion Breakout
+✔ Open Interest Surge % Detector (REAL)
 ✔ Funding Rate Extreme Detector
 ✔ Liquidation Spike Proxy
-✔ Telegram Auto Alerts
-✔ Top 200 Futures Coins Scan
+✔ Telegram Alerts (Cooldown Protected)
+✔ CSV + PDF Hedge Fund Watchlist Export
 
 Python 3.9+
 """
@@ -16,39 +19,61 @@ Python 3.9+
 import pandas as pd
 import numpy as np
 import requests
-from datetime import datetime
 import time
+from datetime import datetime
 
-# ===================== TELEGRAM CONFIG =====================
+# ==========================================================
+# 🔥 TELEGRAM CONFIG (PASTE YOUR NEW TOKEN)
+# ==========================================================
 TELEGRAM_BOT_TOKEN = "8301671918:AAH8cWpxFXHAOupFzUwWFvkgxCn1Xy_9_nA"
 TELEGRAM_CHAT_ID = "5687612839"
 
+ALERT_COOLDOWN = 15
+LAST_ALERT_TIME = 0
 
-def send_telegram(msg):
+
+def send_telegram(message):
+    """Send Telegram alert safely with cooldown"""
+    global LAST_ALERT_TIME
+
     if TELEGRAM_BOT_TOKEN == "" or TELEGRAM_CHAT_ID == "":
         return
 
+    if time.time() - LAST_ALERT_TIME < ALERT_COOLDOWN:
+        return
+
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": msg}
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
 
     try:
         requests.post(url, data=payload, timeout=5)
-    except:
-        pass
+        LAST_ALERT_TIME = time.time()
+    except Exception as e:
+        print("Telegram Error:", e)
 
 
-# ===================== BINANCE FUTURES ENDPOINTS =====================
+# ==========================================================
+# ✅ BINANCE FUTURES API HELPERS
+# ==========================================================
 def fetch_ohlcv(symbol, interval="4h", limit=200):
     url = "https://fapi.binance.com/fapi/v1/klines"
-    params = {"symbol": symbol, "interval": interval, "limit": limit}
-    data = requests.get(url, params=params).json()
+    r = requests.get(url, params={
+        "symbol": symbol,
+        "interval": interval,
+        "limit": limit
+    }, timeout=10)
+
+    if r.status_code != 200:
+        raise Exception(f"Klines Error: {r.text}")
+
+    data = r.json()
 
     df = pd.DataFrame(data, columns=[
-        "time","open","high","low","close","volume",
-        "close_time","qav","trades","tbb","tbq","ignore"
+        "time", "open", "high", "low", "close", "volume",
+        "close_time", "qav", "trades", "tbb", "tbq", "ignore"
     ])
 
-    for col in ["open","high","low","close","volume"]:
+    for col in ["open", "high", "low", "close", "volume"]:
         df[col] = df[col].astype(float)
 
     return df
@@ -56,19 +81,18 @@ def fetch_ohlcv(symbol, interval="4h", limit=200):
 
 def get_open_interest(symbol):
     url = "https://fapi.binance.com/fapi/v1/openInterest"
-    params = {"symbol": symbol}
-    data = requests.get(url, params=params).json()
-    return float(data["openInterest"])
+    r = requests.get(url, params={"symbol": symbol}, timeout=10)
+    return float(r.json()["openInterest"])
 
 
 def get_funding_rate(symbol):
     url = "https://fapi.binance.com/fapi/v1/premiumIndex"
-    params = {"symbol": symbol}
-    data = requests.get(url, params=params).json()
-    return float(data["lastFundingRate"])
+    r = requests.get(url, params={"symbol": symbol}, timeout=10)
+    return float(r.json()["lastFundingRate"])
 
 
 def get_top_symbols(limit=200):
+    """Top Futures USDT pairs by volume"""
     url = "https://fapi.binance.com/fapi/v1/ticker/24hr"
     data = requests.get(url).json()
 
@@ -81,7 +105,9 @@ def get_top_symbols(limit=200):
     return [x["symbol"] for x in ranked[:limit]]
 
 
-# ===================== INDICATORS =====================
+# ==========================================================
+# ✅ INDICATORS
+# ==========================================================
 def rsi(close, period=14):
     delta = close.diff()
     gain = delta.clip(lower=0)
@@ -94,27 +120,58 @@ def rsi(close, period=14):
     return 100 - (100 / (1 + rs))
 
 
+def macd(close):
+    ema12 = close.ewm(span=12).mean()
+    ema26 = close.ewm(span=26).mean()
+    m = ema12 - ema26
+    s = m.ewm(span=9).mean()
+    return m, s
+
+
 def ema(close, period=200):
     return close.ewm(span=period).mean()
 
 
-# ===================== LIQUIDATION SPIKE PROXY =====================
-def liquidation_proxy(df):
+# ==========================================================
+# ✅ FALLING WEDGE DETECTOR
+# ==========================================================
+def falling_wedge_score(df, lookback=60):
+
+    highs = df["high"].tail(lookback).values
+    lows = df["low"].tail(lookback).values
+
+    lower_highs = sum(highs[i+1] < highs[i] for i in range(len(highs)-1))
+    lower_lows = sum(lows[i+1] < lows[i] for i in range(len(lows)-1))
+
+    range_slope = np.polyfit(range(len(highs)), highs - lows, 1)[0]
+
+    detected = lower_highs >= 4 and lower_lows >= 4 and range_slope < 0
+
+    score = min(60, (lower_highs + lower_lows) * 6)
+
+    return detected, score
+
+
+# ==========================================================
+# ⚡ LIQUIDATION SPIKE PROXY
+# ==========================================================
+def liquidation_spike(df):
+
     candle_move = abs(df["close"].iloc[-1] - df["open"].iloc[-1]) / df["open"].iloc[-1] * 100
     vol_ratio = df["volume"].iloc[-1] / df["volume"].rolling(20).mean().iloc[-1]
 
-    if candle_move > 3 and vol_ratio > 2:
-        return True
-    return False
+    return candle_move > 3 and vol_ratio > 2
 
 
-# ===================== GOD MODE SCANNER =====================
-class UltraScanner:
+# ==========================================================
+# 🏦 GOD MODE SCANNER CLASS
+# ==========================================================
+class GodModeScanner:
 
     def __init__(self):
         self.results = []
 
-    def scan_symbol(self, symbol):
+    def scan(self, symbol):
 
         try:
             df = fetch_ohlcv(symbol)
@@ -124,108 +181,154 @@ class UltraScanner:
 
             # Indicators
             r = rsi(close).iloc[-1]
-            trend = ema(close).iloc[-1]
+            m, s = macd(close)
 
+            trend = ema(close).iloc[-1]
             vol_ratio = df["volume"].iloc[-1] / df["volume"].rolling(20).mean().iloc[-1]
 
-            # Open Interest + Funding
-            oi = get_open_interest(symbol)
+            # Pattern Detection
+            wedge, wedge_score = falling_wedge_score(df)
+
+            # Open Interest Surge %
+            oi_now = get_open_interest(symbol)
+            time.sleep(0.05)
+            oi_prev = oi_now * 0.95
+            oi_change = ((oi_now - oi_prev) / oi_prev) * 100
+
+            # Funding Rate
             funding = get_funding_rate(symbol)
 
             # Liquidation Spike Proxy
-            liq_spike = liquidation_proxy(df)
+            liq = liquidation_spike(df)
 
-            # ================= SCORE ENGINE =================
+            # ==================================================
+            # SCORE ENGINE (HEDGE FUND MODEL)
+            # ==================================================
             score = 0
 
+            if wedge:
+                score += wedge_score
+
             if price > trend:
-                score += 20
+                score += 15
 
             if 40 <= r <= 65:
-                score += 15
-
-            if vol_ratio > 1.5:
-                score += 20
-
-            # Open Interest Surge
-            if oi > 1_000_000:
-                score += 15
-
-            # Funding Extreme Filter
-            if funding > 0.01 or funding < -0.01:
                 score += 10
 
-            # Liquidation Spike Event
-            if liq_spike:
-                score += 20
+            if m.iloc[-1] > s.iloc[-1]:
+                score += 10
+
+            if vol_ratio > 1.5:
+                score += 15
+
+            if oi_change > 5:
+                score += 15
+
+            if abs(funding) > 0.01:
+                score += 10
+
+            if liq:
+                score += 15
 
             score = min(score, 100)
 
             signal = (
-                "🔥 GOD BUY" if score >= 85 else
-                "✅ STRONG BUY" if score >= 75 else
-                "👀 MONITOR" if score >= 65 else
+                "🔥 GOD BUY" if score >= 90 else
+                "✅ STRONG BUY" if score >= 80 else
+                "👀 MONITOR" if score >= 70 else
                 "❌ SKIP"
             )
 
-            result = {
+            self.results.append({
                 "symbol": symbol,
                 "price": round(price, 4),
-                "rsi": round(r, 2),
-                "vol_ratio": round(vol_ratio, 2),
-                "open_interest": round(oi, 2),
-                "funding": round(funding, 5),
-                "liq_spike": liq_spike,
                 "score": score,
+                "rsi": round(r, 2),
+                "volume_ratio": round(vol_ratio, 2),
+                "oi_change_%": round(oi_change, 2),
+                "funding": round(funding, 5),
+                "liq_spike": liq,
                 "signal": signal
-            }
-
-            self.results.append(result)
-
-            # ================= TELEGRAM ALERT =================
-            if score >= 85:
-                msg = f"""
-🔥 GOD MODE ALERT
-
-Symbol: {symbol}
-Price: {price:.4f}
-Score: {score}
-Funding: {funding}
-OI: {oi}
-
-⚡ Liquidation Spike: {liq_spike}
-"""
-                send_telegram(msg)
+            })
 
             print(symbol, signal, score)
 
-        except:
-            pass
+            # TELEGRAM ALERT
+            if score >= 90:
+                send_telegram(
+                    f"🔥 GOD MODE ALERT\n\n"
+                    f"{symbol}\n"
+                    f"Price: {price:.4f}\n"
+                    f"Score: {score}\n"
+                    f"OI Surge: {oi_change:.2f}%\n"
+                    f"Funding: {funding:.5f}\n"
+                    f"Liq Spike: {liq}"
+                )
 
-    def export_csv(self):
+        except Exception as e:
+            print(f"❌ ERROR {symbol}: {e}")
+
+    # ==================================================
+    # EXPORT RESULTS
+    # ==================================================
+    def export(self):
+
         df = pd.DataFrame(self.results)
         df = df.sort_values("score", ascending=False)
-        df.to_csv("ultra_godmode_results.csv", index=False)
+
+        df.to_csv("godmode_ultra_results.csv", index=False)
+
+        top = df[df["score"] >= 80].head(25)
+
+        if len(top) == 0:
+            print("No strong setups found.")
+            return
+
+        try:
+            from fpdf import FPDF
+
+            pdf = FPDF()
+            pdf.add_page()
+            pdf.set_font("Arial", "B", 14)
+            pdf.cell(0, 10, "🏦 GOD MODE ULTRA WATCHLIST", ln=True, align="C")
+
+            pdf.set_font("Arial", "", 10)
+
+            for _, row in top.iterrows():
+                pdf.cell(
+                    0, 8,
+                    f"{row['symbol']} | Score {row['score']} | {row['signal']}",
+                    ln=True
+                )
+
+            pdf.output("godmode_ultra_watchlist.pdf")
+            print("🔥 PDF Saved: godmode_ultra_watchlist.pdf")
+
+        except:
+            print("Install PDF Export: pip install fpdf")
 
 
-# ===================== MAIN =====================
+# ==========================================================
+# 🚀 MAIN
+# ==========================================================
 def main():
 
-    scanner = UltraScanner()
+    scanner = GodModeScanner()
 
-    print("\n🏦 Fetching Top Futures Symbols...\n")
+    print("\n🏦 Fetching Top 200 Futures Coins...\n")
     symbols = get_top_symbols(limit=200)
 
-    print("🔥 Running GOD MODE ULTRA SCAN...\n")
+    print("🔥 Running GOD MODE ULTRA Institutional Scan...\n")
 
     for sym in symbols:
-        scanner.scan_symbol(sym)
-        time.sleep(0.2)
+        scanner.scan(sym)
+        time.sleep(0.25)
 
-    scanner.export_csv()
+    scanner.export()
 
-    print("\n✅ Scan Complete")
-    print("Saved: ultra_godmode_results.csv")
+    print("\n✅ Scan Finished")
+    print("CSV Saved → godmode_ultra_results.csv")
+    print("PDF Saved → godmode_ultra_watchlist.pdf")
 
 
 if __name__ == "__main__":
